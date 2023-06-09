@@ -1,0 +1,218 @@
+---
+title: "Connect Usage"
+output:
+  html_document:
+    code_folding: hide
+    code_download: true
+runtime: shiny
+---
+
+```{r warning=F, message=F}
+library(tidyverse)
+library(lubridate)
+library(connectapi)
+library(DT)
+
+# set up a table display helper
+displayTable <- function(df) {
+   df %>%
+      DT::datatable(
+         extensions = c('Buttons', 'KeyTable','ColReorder','Scroller'), 
+         options = list(dom = 'ifrtpB', 
+                        deferRender = TRUE,
+                        scrollX = TRUE,
+                        scrollY = 600,
+                        scroller = TRUE,
+                        keys=TRUE,
+                        bFilter=FALSE,
+                        colReorder = list(realtime = FALSE),
+                        buttons = c('copy', 'csv', 'excel')))
+  
+}
+
+```
+
+```{r warning=F, message=F}
+client <- connect(
+  host = Sys.getenv("CONNECT_SERVER_URL"),
+  api_key = Sys.getenv("CONNECT_API_KEY")
+)
+
+start_date <- today() - days(90)
+date_range <- tibble(date = seq(start_date, today(), "day"))
+
+contents <- connectapi::get_content(client, limit=Inf)
+shiny_usage <- get_usage_shiny(client, limit=100000,from = start_date)
+all_users <- get_users(client, limit = 1000) %>% 
+  transmute(
+    user_guid = guid, 
+    name = paste(first_name, last_name, sep=" ")
+    )
+
+shiny_usage <-
+  shiny_usage %>% 
+  transmute(
+    user_guid,
+    content_guid,
+    date = date(started),
+    duration = ended-started
+  )
+
+usage_table <-
+  contents %>% 
+  select(content_guid = guid, title, url) %>% 
+  inner_join(shiny_usage, by="content_guid") %>% 
+  inner_join(all_users, by="user_guid") %>% 
+  select(name, date, duration, title, url, content_guid)
+
+current_values <- reactiveValues()
+```
+
+
+```{r warning=F, message=F}
+selections <-
+  usage_table %>% 
+  select(title, content_guid) %>% 
+  distinct() %>% 
+  arrange(title) %>% 
+  deframe()
+selections <- c("Choose" = "", selections)
+selectInput("which_app", "Which app?", choices=selections, selected=NULL)
+```
+
+## Analysis {.tabset}
+
+### Sessions per user
+
+```{r}
+renderPlot({
+  req(current_values$complete_sessions)
+  
+  current_values$complete_sessions %>% 
+    ggplot() +
+    geom_step(aes(date, count, colour=name)) + 
+    facet_wrap(~name)
+
+})
+```
+
+### Sessions per day
+
+```{r}
+renderPlot({
+  req(current_values$complete_sessions)
+  
+  current_values$complete_sessions %>% 
+    ggplot() +
+    geom_col(aes(date, count, fill=name)) 
+
+})
+```
+
+### Use per user
+
+**Note:** Be careful with session uses here - a browser tab left open counts as "use"
+
+```{r}
+renderPlot({
+  req(current_values$complete_sessions)
+  
+  current_values$complete_sessions %>% 
+    ggplot() +
+    geom_step(aes(date, total, colour=name)) + 
+    ylab("Time in seconds") +
+    facet_wrap(~name) 
+
+})
+```
+
+### Use per day
+
+**Note:** Be careful with session uses here - a browser tab left open counts as "use"
+
+```{r}
+renderPlot({
+  req(current_values$complete_sessions)
+  
+  current_values$complete_sessions %>% 
+    ggplot() +
+    geom_col(aes(date, total, fill=name)) + 
+    ylab("Time in seconds") 
+
+})
+```
+
+### Summary Per User
+
+```{r}
+renderDT({
+  req(current_values$summary_per_user)
+  displayTable(current_values$summary_per_user)
+})
+```
+
+### Raw
+
+```{r}
+renderDT({
+  req(current_values$usage)
+  displayTable(current_values$usage)
+})
+```
+
+### Calcs and Stats
+
+Total loaded:
+
+- `r nrow(shiny_usage)` usage records since `r start_date`
+- `r nrow(all_users)` users  (not all Shiny)
+- `r nrow(contents)` content items (not all Shiny)
+
+```{r}
+observeEvent(input$which_app, {
+  req(input$which_app)
+  
+  usage <-
+    usage_table %>% 
+    filter(content_guid == input$which_app)
+  
+  summary_per_user <- 
+    usage %>% 
+    group_by(name) %>% 
+    summarise(
+      num_sessions = n(),
+      num_distinct_days = date %>% n_distinct(),
+      average_session = mean(duration),
+      min_session = min(duration),
+      max_session = max(duration),
+      total = sum(duration)
+    ) %>% 
+    arrange(name)
+  
+  sessions <- 
+    usage %>%
+    transmute(name, date, duration) %>% 
+    group_by(name, date) %>% 
+    summarise(count = n(), total=sum(duration))
+  
+  unique_users <- 
+    summary_per_user %>% 
+    select(name) %>% 
+    unique()
+  
+  complete_sessions <- 
+    date_range %>% 
+    crossing(unique_users) %>% 
+    left_join(sessions, by=c("date", "name")) %>% 
+    mutate(
+      count = replace_na(count, 0),
+      total = replace_na(total, 0)
+    )
+
+  current_values$usage <- usage
+  current_values$summary_per_user <- summary_per_user
+  current_values$complete_sessions <- complete_sessions
+})
+
+```
+
